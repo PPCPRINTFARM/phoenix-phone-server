@@ -1,15 +1,16 @@
 {
-    "name": "phoenix-phone-server",
-    "version": "1.0.0",
-    "description": "Phoenix Phone Server - Twilio-based phone system backend",
-    "main": "index.js",
-    "scripts": {
-          "start": "node index.js"
-    },
-    "dependencies": {
-          "express": "^4.18.2",
-          "twilio": "^4.19.0",
-          "dotenv": "^16.3.1",
-          "cors": "^2.8.5"
-    }
+  "name": "phoenix-phone-server",
+  "version": "1.0.0",
+  "description": "Phoenix Phone Server - Twilio-based phone system backend",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "twilio": "^4.19.0",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5",
+    "ws": "^8.16.0"
+  }
 }
