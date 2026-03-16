@@ -178,15 +178,17 @@ app.post('/incoming', (req, res) => {
 
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna' }, 'Thank you for calling Phoenix Phase Converters. Please hold and an agent will be with you shortly.');
-  twiml.redirect({ method: 'POST' }, `${config.appBaseUrl}/twiml/hold-loop`);
+  twiml.redirect(`${config.appBaseUrl}/twiml/hold-loop`);
   res.type('text/xml').send(twiml.toString());
 });
 
 app.post('/twiml/hold-loop', (req, res) => {
-  const twiml = new VoiceResponse();
-  twiml.play({ loop: 10 }, 'http://com.twilio.sounds.music.s3.amazonaws.com/MARKOVICHAMP-B8_HD.mp3');
-  twiml.redirect({ method: 'POST' }, `${config.appBaseUrl}/twiml/hold-loop`);
-  res.type('text/xml').send(twiml.toString());
+  // Use raw TwiML to avoid SDK issues with redirect
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play loop="0">https://demo.twilio.com/docs/classic.mp3</Play>
+</Response>`;
+  res.type('text/xml').send(xml);
 });
 
 app.post('/retell-transfer', (req, res) => {
@@ -208,7 +210,7 @@ app.post('/retell-transfer', (req, res) => {
 
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna' }, 'Please hold while I transfer you.');
-  twiml.redirect({ method: 'POST' }, `${config.appBaseUrl}/twiml/hold-loop`);
+  twiml.redirect(`${config.appBaseUrl}/twiml/hold-loop`);
   res.type('text/xml').send(twiml.toString());
 });
 
