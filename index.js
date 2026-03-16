@@ -206,7 +206,7 @@ app.post('/twiml/hold-loop', (req, res) => {
   // Use raw TwiML to avoid SDK issues with redirect
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play loop="0">https://demo.twilio.com/docs/classic.mp3</Play>
+  <Play loop="0">https://lucent-bubblegum-bed54c.netlify.app/hold-music.mp3</Play>
 </Response>`;
   res.type('text/xml').send(xml);
 });
