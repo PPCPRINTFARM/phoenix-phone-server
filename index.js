@@ -176,19 +176,12 @@ app.post('/incoming', (req, res) => {
   });
   pushState();
 
-  // Set status callback so we know when caller hangs up
-  if (client) {
-    client.calls(CallSid).update({
-      statusCallback: `${config.appBaseUrl}/call-status`,
-      statusCallbackMethod: 'POST',
-      statusCallbackEvent: ['completed', 'canceled', 'failed'],
-    }).catch(e => console.error('[STATUS CALLBACK] set error:', e.message));
-  }
-
-  const twiml = new VoiceResponse();
-  twiml.say({ voice: 'Polly.Joanna' }, 'Thank you for calling Phoenix Phase Converters. Please hold and an agent will be with you shortly.');
-  twiml.redirect(`${config.appBaseUrl}/twiml/hold-loop`);
-  res.type('text/xml').send(twiml.toString());
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna">Thank you for calling Phoenix Phase Converters. Please hold and an agent will be with you shortly.</Say>
+  <Redirect method="POST">${config.appBaseUrl}/twiml/hold-loop</Redirect>
+</Response>`;
+  res.type('text/xml').send(xml);
 });
 
 // Called by Twilio when a call ends for any reason
@@ -349,4 +342,14 @@ server.listen(PORT, () => {
   console.log(`   Agents: Glen (${config.agents.glen.phone}), Danny (${config.agents.danny.phone})`);
   console.log(`   Twilio: ${config.twilioNumber}`);
   console.log(`   Base URL: ${config.appBaseUrl}`);
+});
+
+// Manual queue clear endpoint (for flushing stale calls)
+app.post('/clear-queue', (req, res) => {
+  callQueue.length = 0;
+  Object.keys(activeCalls).forEach(k => delete activeCalls[k]);
+  Object.values(config.agents).forEach(a => { a.activeSid = null; a.available = false; });
+  pushState();
+  console.log('[CLEAR] Queue cleared manually');
+  res.json({ ok: true });
 });
