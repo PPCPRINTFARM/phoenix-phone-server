@@ -270,14 +270,45 @@ app.post('/clear-queue', (req, res) => {
 // ─── LOOKUP ROUTES ────────────────────────────────────────────────────────────
 app.get('/lookup/callrail', async (req, res) => {
   const { phone } = req.query;
-  if (!phone) return res.json({ calls: [] });
+  if (!phone) return res.json({ calls: [], summary: null });
   try {
     const clean = phone.replace(/\D/g, '');
-    const r = await fetch(`https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?search=${clean}&fields=answered,direction,duration,tracking_source,first_call,created_at,caller_name&per_page=10&sort=created_at&order=desc`, {
-      headers: { Authorization: `Token token=${CALLRAIL_API_KEY}` }
-    });
-    res.json(await r.json());
-  } catch(e) { res.json({ calls: [] }); }
+    // Fetch calls with all useful fields
+    const fields = [
+      'answered','direction','duration','tracking_source','first_call',
+      'created_at','caller_name','note','tags','value','recording',
+      'transcription','keywords_spotted','lead_status','classification'
+    ].join(',');
+    const r = await fetch(
+      `https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?search=${clean}&fields=${fields}&per_page=25&sort=created_at&order=desc`,
+      { headers: { Authorization: `Token token=${CALLRAIL_API_KEY}` } }
+    );
+    const data = await r.json();
+    const calls = data.calls || [];
+
+    // Build summary
+    const summary = {
+      total: calls.length,
+      answered: calls.filter(c => c.answered).length,
+      missed: calls.filter(c => !c.answered).length,
+      firstCall: calls.length > 0 ? calls[calls.length-1]?.created_at : null,
+      lastCall: calls.length > 0 ? calls[0]?.created_at : null,
+      totalValue: calls.reduce((sum, c) => sum + (parseFloat(c.value) || 0), 0),
+      salesCalls: calls.filter(c => (c.tags||[]).some(t => /sale|sales|order|purchase/i.test(t)) || c.lead_status === 'good_lead').length,
+      supportCalls: calls.filter(c => (c.tags||[]).some(t => /support|technical|trouble|help/i.test(t))).length,
+      lastNote: calls[0]?.note || null,
+      lastTranscription: calls[0]?.transcription || null,
+      lastTags: calls[0]?.tags || [],
+      lastSource: calls[0]?.tracking_source || null,
+      callerName: calls[0]?.caller_name || null,
+      leadStatus: calls[0]?.lead_status || null,
+    };
+
+    res.json({ calls, summary });
+  } catch(e) {
+    console.error('[CALLRAIL]', e.message);
+    res.json({ calls: [], summary: null, error: e.message });
+  }
 });
 
 app.get('/lookup/shopify', async (req, res) => {
