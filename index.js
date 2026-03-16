@@ -3,6 +3,8 @@ const { WebSocketServer } = require('ws');
 const http = require('http');
 const twilio = require('twilio');
 const VoiceResponse = require('twilio').twiml.VoiceResponse;
+const AccessToken = require('twilio').jwt.AccessToken;
+const VoiceGrant = AccessToken.VoiceGrant;
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -19,11 +21,14 @@ const wss = new WebSocketServer({ server });
 const config = {
   accountSid:   process.env.TWILIO_ACCOUNT_SID,
   authToken:    process.env.TWILIO_AUTH_TOKEN,
+  apiKey:       process.env.TWILIO_API_KEY,
+  apiSecret:    process.env.TWILIO_API_SECRET,
+  twimlAppSid:  process.env.TWILIO_TWIML_APP_SID,
   twilioNumber: process.env.TWILIO_PHONE_NUMBER || '+14849398817',
   appBaseUrl:   process.env.APP_BASE_URL || 'https://phoenix-phone-server.onrender.com',
   agents: {
-    glen:  { name: 'Glen',  phone: '+16028264579', identity: 'glen',  available: false, activeSid: null },
-    danny: { name: 'Danny', phone: '+16023309595', identity: 'danny', available: false, activeSid: null },
+    glen:  { name: 'Glen',  identity: 'glen',  available: false, activeSid: null },
+    danny: { name: 'Danny', identity: 'danny', available: false, activeSid: null },
   },
 };
 
@@ -62,42 +67,7 @@ async function handleAgentMessage(msg, ws) {
   if (type === 'SET_AVAILABLE') {
     if (config.agents[agentId]) {
       config.agents[agentId].available = msg.available;
-      console.log(`[AGENT] ${agentId} available=${msg.available}`);
       pushState();
-    }
-  }
-
-  if (type === 'ANSWER_NEXT') {
-    const next = msg.callSid
-      ? callQueue.find(c => c.callSid === msg.callSid && c.status === 'waiting')
-      : callQueue.find(c => c.status === 'waiting');
-
-    if (!next) return ws.send(JSON.stringify({ type: 'ERROR', msg: 'No waiting callers' }));
-    if (!config.agents[agentId]?.available) return ws.send(JSON.stringify({ type: 'ERROR', msg: 'You are unavailable' }));
-
-    next.status = 'connecting';
-    config.agents[agentId].activeSid = next.callSid;
-    config.agents[agentId].available = false;
-    activeCalls[next.callSid] = { agentIdentity: agentId, startedAt: Date.now(), onHold: false };
-    pushState();
-
-    try {
-      if (client) {
-        await client.calls(next.callSid).update({
-          url: `${config.appBaseUrl}/twiml/bridge-to-agent?agentId=${agentId}`,
-          method: 'POST',
-        });
-      }
-      next.status = 'active';
-      pushState();
-    } catch (e) {
-      console.error('[ANSWER_NEXT] error', e.message);
-      next.status = 'waiting';
-      config.agents[agentId].activeSid = null;
-      config.agents[agentId].available = true;
-      delete activeCalls[next.callSid];
-      pushState();
-      ws.send(JSON.stringify({ type: 'ERROR', msg: 'Failed to connect: ' + e.message }));
     }
   }
 
@@ -118,9 +88,10 @@ async function handleAgentMessage(msg, ws) {
     const call = activeCalls[callSid];
     if (!call) return;
     call.onHold = false;
+    // Re-conference with agent
     if (client) {
       await client.calls(callSid).update({
-        url: `${config.appBaseUrl}/twiml/bridge-to-agent?agentId=${call.agentIdentity}`,
+        url: `${config.appBaseUrl}/twiml/conference?room=${callSid}`,
         method: 'POST',
       }).catch(console.error);
     }
@@ -136,36 +107,55 @@ async function handleAgentMessage(msg, ws) {
     config.agents[fromAgent].available = true;
     config.agents[targetAgent].activeSid = callSid;
     config.agents[targetAgent].available = false;
+    // Move caller to new conference room with new agent
     if (client) {
       await client.calls(callSid).update({
-        url: `${config.appBaseUrl}/twiml/bridge-to-agent?agentId=${targetAgent}`,
+        url: `${config.appBaseUrl}/twiml/conference?room=${callSid}`,
         method: 'POST',
       }).catch(console.error);
     }
     pushState();
+    broadcast({ type: 'INCOMING_TRANSFER', callSid, agentId: targetAgent });
   }
 
   if (type === 'HANGUP') {
     if (client) {
       await client.calls(callSid).update({ status: 'completed' }).catch(console.error);
     }
-    const idx = callQueue.findIndex(c => c.callSid === callSid);
-    if (idx > -1) callQueue.splice(idx, 1);
-    const call = activeCalls[callSid];
-    if (call) {
-      config.agents[call.agentIdentity].activeSid = null;
-      config.agents[call.agentIdentity].available = true;
-    }
-    delete activeCalls[callSid];
+    cleanupCall(callSid);
     pushState();
   }
 }
 
+function cleanupCall(callSid) {
+  const idx = callQueue.findIndex(c => c.callSid === callSid);
+  if (idx > -1) callQueue.splice(idx, 1);
+  const call = activeCalls[callSid];
+  if (call && config.agents[call.agentIdentity]) {
+    config.agents[call.agentIdentity].activeSid = null;
+    config.agents[call.agentIdentity].available = true;
+  }
+  delete activeCalls[callSid];
+}
+
+// ─── TWILIO VOICE TOKEN ───────────────────────────────────────────────────────
+app.post('/token', (req, res) => {
+  const { agentId } = req.body;
+  if (!config.agents[agentId]) return res.status(400).json({ error: 'Unknown agent' });
+  if (!config.apiKey || !config.apiSecret) return res.status(500).json({ error: 'API key not configured' });
+
+  const token = new AccessToken(config.accountSid, config.apiKey, config.apiSecret, { identity: agentId, ttl: 3600 });
+  const grant = new VoiceGrant({ outgoingApplicationSid: config.twimlAppSid, incomingAllow: true });
+  token.addGrant(grant);
+  res.json({ token: token.toJwt(), identity: agentId });
+});
+
 // ─── TWILIO WEBHOOKS ─────────────────────────────────────────────────────────
 
+// Inbound call
 app.post('/incoming', (req, res) => {
   const { CallSid, From, CallerName } = req.body;
-  console.log(`[INCOMING] ${From} (${CallerName || 'Unknown'}) SID=${CallSid}`);
+  console.log(`[INCOMING] ${From} SID=${CallSid}`);
 
   callQueue.push({
     callSid: CallSid,
@@ -179,31 +169,13 @@ app.post('/incoming', (req, res) => {
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="Polly.Joanna">Thank you for calling Phoenix Phase Converters. Please hold and an agent will be with you shortly.</Say>
-  <Redirect method="POST">${config.appBaseUrl}/twiml/hold-loop</Redirect>
+  <Play loop="0">https://lucent-bubblegum-bed54c.netlify.app/hold-music.mp3</Play>
 </Response>`;
   res.type('text/xml').send(xml);
 });
 
-// Called by Twilio when a call ends for any reason
-app.post('/call-status', (req, res) => {
-  const { CallSid, CallStatus } = req.body;
-  console.log(`[CALL STATUS] ${CallSid} => ${CallStatus}`);
-  if (['completed', 'canceled', 'failed', 'busy', 'no-answer'].includes(CallStatus)) {
-    const idx = callQueue.findIndex(c => c.callSid === CallSid);
-    if (idx > -1) callQueue.splice(idx, 1);
-    const call = activeCalls[CallSid];
-    if (call) {
-      config.agents[call.agentIdentity].activeSid = null;
-      config.agents[call.agentIdentity].available = true;
-    }
-    delete activeCalls[CallSid];
-    pushState();
-  }
-  res.sendStatus(200);
-});
-
+// Hold loop
 app.post('/twiml/hold-loop', (req, res) => {
-  // Use raw TwiML to avoid SDK issues with redirect
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play loop="0">https://lucent-bubblegum-bed54c.netlify.app/hold-music.mp3</Play>
@@ -211,68 +183,91 @@ app.post('/twiml/hold-loop', (req, res) => {
   res.type('text/xml').send(xml);
 });
 
+// Conference room (agent answers via browser)
+app.post('/twiml/conference', (req, res) => {
+  const { room } = req.query;
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference waitUrl="" beep="false" startConferenceOnEnter="true" endConferenceOnExit="true">${room}</Conference>
+  </Dial>
+</Response>`;
+  res.type('text/xml').send(xml);
+});
+
+// Agent answers - browser SDK calls this via TwiML App
+app.post('/twiml/agent-answer', (req, res) => {
+  const { callSid, agentId } = req.query;
+  console.log(`[AGENT ANSWER] ${agentId} answering ${callSid}`);
+
+  const caller = callQueue.find(c => c.callSid === callSid);
+  if (caller) {
+    caller.status = 'active';
+    activeCalls[callSid] = { agentIdentity: agentId, startedAt: Date.now(), onHold: false };
+    if (config.agents[agentId]) {
+      config.agents[agentId].activeSid = callSid;
+      config.agents[agentId].available = false;
+    }
+    // Move caller into conference
+    if (client) {
+      client.calls(callSid).update({
+        url: `${config.appBaseUrl}/twiml/conference?room=${callSid}`,
+        method: 'POST',
+      }).catch(console.error);
+    }
+    pushState();
+  }
+
+  // Agent also joins same conference
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference waitUrl="" beep="false" startConferenceOnEnter="true" endConferenceOnExit="true">${callSid}</Conference>
+  </Dial>
+</Response>`;
+  res.type('text/xml').send(xml);
+});
+
+// Call status callback
+app.post('/call-status', (req, res) => {
+  const { CallSid, CallStatus } = req.body;
+  console.log(`[STATUS] ${CallSid} => ${CallStatus}`);
+  if (['completed', 'canceled', 'failed', 'busy', 'no-answer'].includes(CallStatus)) {
+    cleanupCall(CallSid);
+    pushState();
+  }
+  res.sendStatus(200);
+});
+
+// Retell transfer
 app.post('/retell-transfer', (req, res) => {
   const { call_id, from_number, metadata } = req.body;
   const From = from_number || req.body.From || 'Unknown';
   const CallSid = call_id || req.body.CallSid || `retell-${Date.now()}`;
-  console.log(`[RETELL TRANSFER] from=${From} sid=${CallSid}`);
 
   if (!callQueue.find(c => c.callSid === CallSid)) {
-    callQueue.push({
-      callSid: CallSid,
-      caller: From,
-      callerName: metadata?.caller_name || 'Unknown',
-      enqueuedAt: Date.now(),
-      status: 'waiting',
-    });
+    callQueue.push({ callSid: CallSid, caller: From, callerName: metadata?.caller_name || 'Unknown', enqueuedAt: Date.now(), status: 'waiting' });
     pushState();
   }
 
-  const twiml = new VoiceResponse();
-  twiml.say({ voice: 'Polly.Joanna' }, 'Please hold while I transfer you.');
-  twiml.redirect(`${config.appBaseUrl}/twiml/hold-loop`);
-  res.type('text/xml').send(twiml.toString());
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna">Please hold while I transfer you.</Say>
+  <Play loop="0">https://lucent-bubblegum-bed54c.netlify.app/hold-music.mp3</Play>
+</Response>`;
+  res.type('text/xml').send(xml);
 });
 
-app.post('/twiml/bridge-to-agent', (req, res) => {
-  const { agentId } = req.query;
-  const agent = config.agents[agentId];
-  const twiml = new VoiceResponse();
-  if (!agent) {
-    twiml.say('Sorry, agent not found.');
-  } else {
-    const dial = twiml.dial({ callerId: config.twilioNumber, timeout: 30 });
-    dial.number(agent.phone);
-  }
-  res.type('text/xml').send(twiml.toString());
-});
-
-app.post('/twiml/transfer', (req, res) => {
-  const { agentId } = req.query;
-  const agent = config.agents[agentId];
-  const twiml = new VoiceResponse();
-  if (agent) {
-    twiml.say({ voice: 'Polly.Joanna' }, 'Transferring you now.');
-    const dial = twiml.dial({ callerId: config.twilioNumber });
-    dial.number(agent.phone);
-  }
-  res.type('text/xml').send(twiml.toString());
-});
-
-app.post('/twiml/queue-complete', (req, res) => {
-  const { CallSid } = req.body;
-  const idx = callQueue.findIndex(c => c.callSid === CallSid);
-  if (idx > -1) callQueue.splice(idx, 1);
-  delete activeCalls[CallSid];
-  Object.values(config.agents).forEach(a => {
-    if (a.activeSid === CallSid) { a.activeSid = null; a.available = true; }
-  });
+// Manual queue clear
+app.post('/clear-queue', (req, res) => {
+  callQueue.length = 0;
+  Object.keys(activeCalls).forEach(k => delete activeCalls[k]);
+  Object.values(config.agents).forEach(a => { a.activeSid = null; });
   pushState();
-  res.type('text/xml').send(new VoiceResponse().toString());
+  res.json({ ok: true });
 });
 
 // ─── LOOKUP ROUTES ────────────────────────────────────────────────────────────
-
 app.get('/lookup/callrail', async (req, res) => {
   const { phone } = req.query;
   if (!phone) return res.json({ calls: [] });
@@ -317,7 +312,7 @@ app.get('/lookup/notes', async (req, res) => {
 
 app.post('/lookup/notes', async (req, res) => {
   const { phone, note, agentId } = req.body;
-  if (!phone || !note) return res.status(400).json({ error: 'Missing phone or note' });
+  if (!phone || !note) return res.status(400).json({ error: 'Missing' });
   try {
     const key = phone.replace(/\D/g, '');
     const r = await fetch(`${FIREBASE_DB}/caller_notes/${key}.json`);
@@ -325,8 +320,7 @@ app.post('/lookup/notes', async (req, res) => {
     const notes = Array.isArray(existing) ? existing : [];
     notes.unshift({ text: note, ts: Date.now(), agent: agentId || 'unknown' });
     await fetch(`${FIREBASE_DB}/caller_notes/${key}.json`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(notes.slice(0, 20))
     });
     res.json({ ok: true, notes });
@@ -335,14 +329,11 @@ app.post('/lookup/notes', async (req, res) => {
 
 app.get('/test-callrail', async (req, res) => {
   try {
-    const url = `https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?per_page=3&fields=answered,direction,duration,tracking_source,created_at,caller_name`;
-    const r = await fetch(url, { headers: { Authorization: `Token token=${CALLRAIL_API_KEY}` } });
-    const text = await r.text();
-    console.log('[TEST CALLRAIL]', r.status, text.slice(0, 200));
-    res.json({ status: r.status, body: JSON.parse(text) });
-  } catch(e) {
-    res.json({ error: e.message });
-  }
+    const r = await fetch(`https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?per_page=3`, {
+      headers: { Authorization: `Token token=${CALLRAIL_API_KEY}` }
+    });
+    res.json({ status: r.status, body: await r.json() });
+  } catch(e) { res.json({ error: e.message }); }
 });
 
 app.get('/health', (req, res) => res.json({ ok: true, queue: callQueue.length, uptime: process.uptime() }));
@@ -351,17 +342,6 @@ app.get('/', (req, res) => res.json({ service: 'Phoenix Phone System', status: '
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Phoenix Phone System running on port ${PORT}`);
-  console.log(`   Agents: Glen (${config.agents.glen.phone}), Danny (${config.agents.danny.phone})`);
   console.log(`   Twilio: ${config.twilioNumber}`);
   console.log(`   Base URL: ${config.appBaseUrl}`);
-});
-
-// Manual queue clear endpoint (for flushing stale calls)
-app.post('/clear-queue', (req, res) => {
-  callQueue.length = 0;
-  Object.keys(activeCalls).forEach(k => delete activeCalls[k]);
-  Object.values(config.agents).forEach(a => { a.activeSid = null; a.available = false; });
-  pushState();
-  console.log('[CLEAR] Queue cleared manually');
-  res.json({ ok: true });
 });
