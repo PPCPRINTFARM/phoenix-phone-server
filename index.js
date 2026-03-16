@@ -32,7 +32,7 @@ const config = {
   },
 };
 
-const CALLRAIL_API_KEY = process.env.CALLRAIL_API_KEY  || '7de6f836a1feee75ce41493f8e9b64af';
+const CALLRAIL_API_KEY = process.env.CALLRAIL_API_KEY  || '85c1d9096e7c9dc5f3a39110fc87b30c';
 const CALLRAIL_ACCOUNT = process.env.CALLRAIL_ACCOUNT  || '906309465';
 const SHOPIFY_TOKEN    = process.env.SHOPIFY_TOKEN     || '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';
 const SHOPIFY_DOMAIN   = 'electricmotorexperts.myshopify.com';
@@ -312,43 +312,89 @@ app.post('/clear-queue', (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── CALLRAIL WEBHOOK ────────────────────────────────────────────────────────
+const callerDataCache = {}; // phone -> callrail data
+
+app.post('/callrail-webhook', (req, res) => {
+  const data = req.body;
+  console.log('[CALLRAIL WEBHOOK]', JSON.stringify(data).slice(0, 200));
+
+  const phone = data.caller_number || data.customer_phone_number || '';
+  if (!phone) return res.sendStatus(200);
+
+  // Store caller data keyed by phone
+  callerDataCache[phone] = {
+    callerName: data.customer_name || data.caller_name || '',
+    source: data.source || data.tracking_source || data.utm_source || '',
+    medium: data.medium || data.utm_medium || '',
+    campaign: data.campaign_name || data.utm_campaign || '',
+    landingPage: data.landing_page_url || '',
+    keywords: data.keywords || '',
+    city: data.caller_city || '',
+    state: data.caller_state || '',
+    firstCall: data.first_call || false,
+    callId: data.id || '',
+    note: data.note || '',
+    tags: data.tags || [],
+    leadStatus: data.lead_status || '',
+    value: data.value || 0,
+    duration: data.duration || 0,
+    answered: data.answered || false,
+    recordingUrl: data.recording || '',
+    ts: Date.now(),
+  };
+
+  // If call is starting, push to queue if not already there
+  if (data.event === 'call.started' || data.event === 'start') {
+    const callSid = data.call_sid || data.id || `cr-${Date.now()}`;
+    const existing = callQueue.find(c => c.caller === phone);
+    if (!existing) {
+      callQueue.push({
+        callSid,
+        caller: phone,
+        callerName: data.customer_name || data.caller_name || 'Unknown',
+        enqueuedAt: Date.now(),
+        status: 'waiting',
+        source: data.source || '',
+      });
+      pushState();
+    }
+  }
+
+  res.sendStatus(200);
+});
+
+// Get cached caller data
+app.get('/caller-data', (req, res) => {
+  const { phone } = req.query;
+  if (!phone) return res.json({});
+  const data = callerDataCache[phone] || callerDataCache['+1'+phone.replace(/\D/g,'')] || {};
+  res.json(data);
+});
+
 // ─── LOOKUP ROUTES ────────────────────────────────────────────────────────────
 app.get('/lookup/callrail', async (req, res) => {
   const { phone } = req.query;
   if (!phone) return res.json({ calls: [], summary: null });
   try {
     const clean = phone.replace(/\D/g, '');
-    // Fetch calls with all useful fields
-    const fields = [
-      'answered','direction','duration','tracking_source','first_call',
-      'created_at','caller_name','note','tags','value','recording',
-      'transcription','keywords_spotted','lead_status','classification'
-    ].join(',');
     const r = await fetch(
-      `https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?search=${clean}&fields=${fields}&per_page=25&sort=created_at&order=desc`,
+      `https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?search=${clean}&fields=answered,direction,duration,tracking_source,first_call,created_at,caller_name,note,tags,lead_status&per_page=25&sort=created_at&order=desc`,
       { headers: { Authorization: `Token token=${CALLRAIL_API_KEY}` } }
     );
     const data = await r.json();
+    console.log('[CALLRAIL] status:', r.status, 'total:', data.total_records);
     const calls = data.calls || [];
-
-    // Build summary
     const summary = {
-      total: calls.length,
+      total: data.total_records || calls.length,
       answered: calls.filter(c => c.answered).length,
       missed: calls.filter(c => !c.answered).length,
-      firstCall: calls.length > 0 ? calls[calls.length-1]?.created_at : null,
-      lastCall: calls.length > 0 ? calls[0]?.created_at : null,
-      totalValue: calls.reduce((sum, c) => sum + (parseFloat(c.value) || 0), 0),
-      salesCalls: calls.filter(c => (c.tags||[]).some(t => /sale|sales|order|purchase/i.test(t)) || c.lead_status === 'good_lead').length,
-      supportCalls: calls.filter(c => (c.tags||[]).some(t => /support|technical|trouble|help/i.test(t))).length,
-      lastNote: calls[0]?.note || null,
-      lastTranscription: calls[0]?.transcription || null,
-      lastTags: calls[0]?.tags || [],
       lastSource: calls[0]?.tracking_source || null,
+      lastNote: calls[0]?.note || null,
+      lastTags: calls[0]?.tags || [],
       callerName: calls[0]?.caller_name || null,
       leadStatus: calls[0]?.lead_status || null,
     };
-
     res.json({ calls, summary });
   } catch(e) {
     console.error('[CALLRAIL]', e.message);
@@ -403,33 +449,41 @@ app.post('/lookup/notes', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// N8N caller lookup proxy (avoids CORS)
+app.post('/lookup/caller', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.json({});
+  try {
+    const r = await fetch('https://phoenixphaseconverters.app.n8n.cloud/webhook/caller-lookup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone })
+    });
+    const d = await r.json();
+    res.json(d);
+  } catch(e) {
+    console.error('[N8N LOOKUP]', e.message);
+    res.json({ error: e.message });
+  }
+});
+
 app.get('/test-apis', async (req, res) => {
   const results = {};
-  
-  // Test CallRail
   try {
-    const fields = 'answered,direction,duration,tracking_source,first_call,created_at,caller_name,note,tags,value,transcription,lead_status,classification,keywords_spotted';
-    const r = await fetch(`https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?per_page=2&fields=${fields}`, {
+    const r = await fetch(`https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?per_page=1&fields=answered,direction,duration,tracking_source,created_at,caller_name,note,tags,lead_status`, {
       headers: { Authorization: `Token token=${CALLRAIL_API_KEY}` }
     });
     const d = await r.json();
-    results.callrail = { status: r.status, totalCalls: d.total_records, sampleKeys: d.calls?.[0] ? Object.keys(d.calls[0]) : [], sample: d.calls?.[0] };
+    results.callrail = { status: r.status, total: d.total_records, error: d.error || null, sampleKeys: d.calls?.[0] ? Object.keys(d.calls[0]) : [] };
   } catch(e) { results.callrail = { error: e.message }; }
-
-  // Test Shopify
   try {
-    const r = await fetch(`https://${SHOPIFY_DOMAIN}/admin/api/2024-01/shop.json`, {
-      headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN }
-    });
+    const r = await fetch(`https://${SHOPIFY_DOMAIN}/admin/api/2024-01/shop.json`, { headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN } });
     results.shopify = { status: r.status, connected: r.status === 200 };
   } catch(e) { results.shopify = { error: e.message }; }
-
-  // Test Firebase
   try {
-    const r = await fetch(`https://checkit-b73a7-default-rtdb.firebaseio.com/.json?shallow=true`);
+    const r = await fetch(`${FIREBASE_DB}/caller_notes.json?shallow=true`);
     results.firebase = { status: r.status, connected: r.status === 200 };
   } catch(e) { results.firebase = { error: e.message }; }
-
   res.json(results);
 });
 
