@@ -176,10 +176,37 @@ app.post('/incoming', (req, res) => {
   });
   pushState();
 
+  // Set status callback so we know when caller hangs up
+  if (client) {
+    client.calls(CallSid).update({
+      statusCallback: `${config.appBaseUrl}/call-status`,
+      statusCallbackMethod: 'POST',
+      statusCallbackEvent: ['completed', 'canceled', 'failed'],
+    }).catch(e => console.error('[STATUS CALLBACK] set error:', e.message));
+  }
+
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'Polly.Joanna' }, 'Thank you for calling Phoenix Phase Converters. Please hold and an agent will be with you shortly.');
   twiml.redirect(`${config.appBaseUrl}/twiml/hold-loop`);
   res.type('text/xml').send(twiml.toString());
+});
+
+// Called by Twilio when a call ends for any reason
+app.post('/call-status', (req, res) => {
+  const { CallSid, CallStatus } = req.body;
+  console.log(`[CALL STATUS] ${CallSid} => ${CallStatus}`);
+  if (['completed', 'canceled', 'failed', 'busy', 'no-answer'].includes(CallStatus)) {
+    const idx = callQueue.findIndex(c => c.callSid === CallSid);
+    if (idx > -1) callQueue.splice(idx, 1);
+    const call = activeCalls[CallSid];
+    if (call) {
+      config.agents[call.agentIdentity].activeSid = null;
+      config.agents[call.agentIdentity].available = true;
+    }
+    delete activeCalls[CallSid];
+    pushState();
+  }
+  res.sendStatus(200);
 });
 
 app.post('/twiml/hold-loop', (req, res) => {
