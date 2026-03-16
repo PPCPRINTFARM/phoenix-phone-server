@@ -333,6 +333,18 @@ app.post('/lookup/notes', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+app.get('/test-callrail', async (req, res) => {
+  try {
+    const url = `https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?per_page=3&fields=answered,direction,duration,tracking_source,created_at,caller_name`;
+    const r = await fetch(url, { headers: { Authorization: `Token token=${CALLRAIL_API_KEY}` } });
+    const text = await r.text();
+    console.log('[TEST CALLRAIL]', r.status, text.slice(0, 200));
+    res.json({ status: r.status, body: JSON.parse(text) });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true, queue: callQueue.length, uptime: process.uptime() }));
 app.get('/', (req, res) => res.json({ service: 'Phoenix Phone System', status: 'running' }));
 
