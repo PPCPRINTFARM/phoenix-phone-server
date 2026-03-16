@@ -27,8 +27,8 @@ const config = {
   twilioNumber: process.env.TWILIO_PHONE_NUMBER || '+14849398817',
   appBaseUrl:   process.env.APP_BASE_URL || 'https://phoenix-phone-server.onrender.com',
   agents: {
-    glen:  { name: 'Glen',  identity: 'glen',  available: false, activeSid: null },
-    danny: { name: 'Danny', identity: 'danny', available: false, activeSid: null },
+    glen:  { name: 'Glen',  phone: '+16028264579', identity: 'glen',  available: false, activeSid: null },
+    danny: { name: 'Danny', phone: '+16023309595', identity: 'danny', available: false, activeSid: null },
   },
 };
 
@@ -68,6 +68,37 @@ async function handleAgentMessage(msg, ws) {
     if (config.agents[agentId]) {
       config.agents[agentId].available = msg.available;
       pushState();
+    }
+  }
+
+  if (type === 'ANSWER_NEXT') {
+    const next = msg.callSid
+      ? callQueue.find(c => c.callSid === msg.callSid && c.status === 'waiting')
+      : callQueue.find(c => c.status === 'waiting');
+
+    if (!next) return ws.send(JSON.stringify({ type: 'ERROR', msg: 'No waiting callers' }));
+
+    next.status = 'connecting';
+    config.agents[agentId].activeSid = next.callSid;
+    activeCalls[next.callSid] = { agentIdentity: agentId, startedAt: Date.now(), onHold: false };
+    pushState();
+
+    try {
+      if (client) {
+        await client.calls(next.callSid).update({
+          url: `${config.appBaseUrl}/twiml/bridge-to-agent?agentId=${agentId}`,
+          method: 'POST',
+        });
+      }
+      next.status = 'active';
+      pushState();
+    } catch (e) {
+      console.error('[ANSWER_NEXT]', e.message);
+      next.status = 'waiting';
+      config.agents[agentId].activeSid = null;
+      delete activeCalls[next.callSid];
+      pushState();
+      ws.send(JSON.stringify({ type: 'ERROR', msg: 'Failed: ' + e.message }));
     }
   }
 
@@ -172,6 +203,20 @@ app.post('/incoming', (req, res) => {
   <Play loop="0">https://lucent-bubblegum-bed54c.netlify.app/hold-music.mp3</Play>
 </Response>`;
   res.type('text/xml').send(xml);
+});
+
+// Bridge caller to agent cell phone
+app.post('/twiml/bridge-to-agent', (req, res) => {
+  const { agentId } = req.query;
+  const agent = config.agents[agentId];
+  const twiml = new VoiceResponse();
+  if (!agent) {
+    twiml.say('Sorry, agent not found.');
+  } else {
+    const dial = twiml.dial({ callerId: config.twilioNumber, timeout: 30 });
+    dial.number(agent.phone);
+  }
+  res.type('text/xml').send(twiml.toString());
 });
 
 // Hold loop
@@ -358,13 +403,34 @@ app.post('/lookup/notes', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/test-callrail', async (req, res) => {
+app.get('/test-apis', async (req, res) => {
+  const results = {};
+  
+  // Test CallRail
   try {
-    const r = await fetch(`https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?per_page=3`, {
+    const fields = 'answered,direction,duration,tracking_source,first_call,created_at,caller_name,note,tags,value,transcription,lead_status,classification,keywords_spotted';
+    const r = await fetch(`https://api.callrail.com/v3/a/${CALLRAIL_ACCOUNT}/calls.json?per_page=2&fields=${fields}`, {
       headers: { Authorization: `Token token=${CALLRAIL_API_KEY}` }
     });
-    res.json({ status: r.status, body: await r.json() });
-  } catch(e) { res.json({ error: e.message }); }
+    const d = await r.json();
+    results.callrail = { status: r.status, totalCalls: d.total_records, sampleKeys: d.calls?.[0] ? Object.keys(d.calls[0]) : [], sample: d.calls?.[0] };
+  } catch(e) { results.callrail = { error: e.message }; }
+
+  // Test Shopify
+  try {
+    const r = await fetch(`https://${SHOPIFY_DOMAIN}/admin/api/2024-01/shop.json`, {
+      headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN }
+    });
+    results.shopify = { status: r.status, connected: r.status === 200 };
+  } catch(e) { results.shopify = { error: e.message }; }
+
+  // Test Firebase
+  try {
+    const r = await fetch(`https://checkit-b73a7-default-rtdb.firebaseio.com/.json?shallow=true`);
+    results.firebase = { status: r.status, connected: r.status === 200 };
+  } catch(e) { results.firebase = { error: e.message }; }
+
+  res.json(results);
 });
 
 app.get('/health', (req, res) => res.json({ ok: true, queue: callQueue.length, uptime: process.uptime() }));
