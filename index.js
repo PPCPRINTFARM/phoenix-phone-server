@@ -284,6 +284,62 @@ app.post('/call-status', (req, res) => {
   res.sendStatus(200);
 });
 
+// ─── QUO (OpenPhone) WEBHOOK ─────────────────────────────────────────────────
+app.post('/quo-webhook', (req, res) => {
+  const event = req.body;
+  const eventType = event.type;
+  console.log(`[QUO WEBHOOK] type=${eventType} id=${event.id}`);
+
+  if (!event.data || !event.data.object) {
+    console.log('[QUO WEBHOOK] No data.object in payload');
+    return res.sendStatus(200);
+  }
+
+  const call = event.data.object;
+
+  // Handle call.ringing — incoming call just started
+  if (eventType === 'call.ringing') {
+    const callId = call.id; // AC...
+    const direction = call.direction; // 'incoming' or 'outgoing'
+    const from = direction === 'incoming' ? (call.participants?.[0] || call.from) : call.from;
+    const to = direction === 'incoming' ? call.to : (call.participants?.[0] || call.to);
+    const phoneNumberId = call.phoneNumberId;
+
+    console.log(`[QUO RINGING] ${direction} from=${from} to=${to} callId=${callId}`);
+
+    // Only queue incoming calls (skip outbound)
+    if (direction !== 'incoming') {
+      return res.sendStatus(200);
+    }
+
+    // Check if already in queue (avoid duplicates)
+    const existing = callQueue.find(c => c.callSid === callId || c.caller === from);
+    if (!existing) {
+      callQueue.push({
+        callSid: callId,
+        caller: from,
+        callerName: 'Unknown', // QUO ringing event doesn't include name, enrichment will fill it
+        enqueuedAt: Date.now(),
+        status: 'waiting',
+        source: 'quo',
+        phoneNumberId: phoneNumberId,
+      });
+      console.log(`[QUO] Added to queue: ${from} (${callId})`);
+      pushState();
+    }
+  }
+
+  // Handle call.completed — call ended
+  if (eventType === 'call.completed') {
+    const callId = call.id;
+    console.log(`[QUO COMPLETED] callId=${callId} duration=${call.duration}s`);
+    cleanupCall(callId);
+    pushState();
+  }
+
+  res.sendStatus(200);
+});
+
 // Retell transfer
 app.post('/retell-transfer', (req, res) => {
   const { call_id, from_number, metadata } = req.body;
