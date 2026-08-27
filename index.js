@@ -43,6 +43,42 @@ const client = config.accountSid ? twilio(config.accountSid, config.authToken) :
 const callQueue   = [];
 const activeCalls = {};
 
+function sendAgentMessage(ws, type, msg, extra = {}) {
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ type, msg, ...extra }));
+}
+
+function isTwilioCallSid(callSid) {
+  return /^CA[0-9a-f]{32}$/i.test(callSid || '');
+}
+
+async function getConferenceSid(callSid) {
+  const call = activeCalls[callSid];
+  if (call?.conferenceSid) return call.conferenceSid;
+
+  const room = call?.room || `room-${callSid}`;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const conferences = await client.conferences.list({
+      friendlyName: room,
+      status: 'in-progress',
+      limit: 1,
+    });
+    if (conferences[0]) {
+      if (call) call.conferenceSid = conferences[0].sid;
+      return conferences[0].sid;
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  throw new Error('The live conference was not found');
+}
+
+async function setCallerHold(callSid, hold) {
+  const conferenceSid = await getConferenceSid(callSid);
+  const update = hold
+    ? { hold: true, holdUrl: `${config.appBaseUrl}/twiml/hold-loop`, holdMethod: 'POST' }
+    : { hold: false };
+  await client.conferences(conferenceSid).participants(callSid).update(update);
+}
+
 function broadcast(data) {
   const msg = JSON.stringify(data);
   wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
@@ -76,57 +112,68 @@ async function handleAgentMessage(msg, ws) {
       ? callQueue.find(c => c.callSid === msg.callSid && c.status === 'waiting')
       : callQueue.find(c => c.status === 'waiting');
 
-    if (!next) return ws.send(JSON.stringify({ type: 'ERROR', msg: 'No waiting callers' }));
+    if (!next) return sendAgentMessage(ws, 'ERROR', 'No waiting callers');
+    if (!config.agents[agentId]?.available) return sendAgentMessage(ws, 'ERROR', 'Set yourself available first');
+    if (!isTwilioCallSid(next.callSid) || next.source === 'quo') {
+      return sendAgentMessage(ws, 'ERROR', 'This is a Quo call and cannot be answered in the Twilio app');
+    }
 
     next.status = 'connecting';
     config.agents[agentId].activeSid = next.callSid;
-    activeCalls[next.callSid] = { agentIdentity: agentId, startedAt: Date.now(), onHold: false };
+    activeCalls[next.callSid] = {
+      agentIdentity: agentId,
+      startedAt: Date.now(),
+      onHold: false,
+      room: `room-${next.callSid}`,
+    };
     pushState();
 
     try {
       if (client) {
         await client.calls(next.callSid).update({
-          url: `${config.appBaseUrl}/twiml/bridge-to-agent?agentId=${agentId}`,
+          url: `${config.appBaseUrl}/twiml/bridge-to-agent?agentId=${agentId}&callSid=${next.callSid}`,
           method: 'POST',
         });
       }
       next.status = 'active';
       pushState();
+      sendAgentMessage(ws, 'ACTION_OK', 'Connecting caller');
     } catch (e) {
       console.error('[ANSWER_NEXT]', e.message);
       next.status = 'waiting';
       config.agents[agentId].activeSid = null;
       delete activeCalls[next.callSid];
       pushState();
-      ws.send(JSON.stringify({ type: 'ERROR', msg: 'Failed: ' + e.message }));
+      sendAgentMessage(ws, 'ERROR', 'Failed: ' + e.message);
     }
   }
 
   if (type === 'HOLD') {
     const call = activeCalls[callSid];
-    if (!call) return;
-    call.onHold = true;
-    if (client) {
-      await client.calls(callSid).update({
-        url: `${config.appBaseUrl}/twiml/hold-loop`,
-        method: 'POST',
-      }).catch(console.error);
+    if (!call) return sendAgentMessage(ws, 'ERROR', 'Active call not found');
+    try {
+      await setCallerHold(callSid, true);
+      call.onHold = true;
+      pushState();
+      sendAgentMessage(ws, 'ACTION_OK', 'Caller is on hold');
+    } catch (e) {
+      console.error('[HOLD]', e.message);
+      sendAgentMessage(ws, 'ERROR', 'Hold failed: ' + e.message);
     }
-    pushState();
   }
 
-  if (type === 'RESUME') {
+  if (type === 'RESUME' || type === 'UNHOLD') {
     const call = activeCalls[callSid];
-    if (!call) return;
-    call.onHold = false;
-    // Re-conference with agent
-    if (client) {
-      await client.calls(callSid).update({
-        url: `${config.appBaseUrl}/twiml/conference?room=${callSid}`,
-        method: 'POST',
-      }).catch(console.error);
+    if (!call) return sendAgentMessage(ws, 'ERROR', 'Active call not found');
+    try {
+      await setCallerHold(callSid, false);
+      call.onHold = false;
+      pushState();
+      sendAgentMessage(ws, 'ACTION_OK', 'Caller resumed');
+    } catch (e) {
+      console.error('[RESUME]', e.message);
+      sendAgentMessage(ws, 'ERROR', 'Resume failed: ' + e.message);
     }
-    pushState();
   }
 
   if (type === 'TRANSFER') {
@@ -205,17 +252,54 @@ app.post('/incoming', (req, res) => {
   res.type('text/xml').send(xml);
 });
 
-// Bridge caller to agent cell phone
+// Put the caller and the agent's phone in one conference. Hold/resume then
+// changes only the caller participant and leaves the agent leg connected.
 app.post('/twiml/bridge-to-agent', (req, res) => {
-  const { agentId } = req.query;
+  const { agentId, callSid } = req.query;
   const agent = config.agents[agentId];
   const twiml = new VoiceResponse();
-  if (!agent) {
+  if (!agent || !isTwilioCallSid(callSid)) {
     twiml.say('Sorry, agent not found.');
   } else {
-    const dial = twiml.dial({ callerId: config.twilioNumber, timeout: 30 });
-    dial.number(agent.phone);
+    const room = `room-${callSid}`;
+    twiml.dial().conference(room, {
+      beep: false,
+      startConferenceOnEnter: true,
+      endConferenceOnExit: false,
+      waitUrl: `${config.appBaseUrl}/twiml/hold-loop`,
+    });
+
+    const call = activeCalls[callSid];
+    if (call && !call.agentLegSid) {
+      client.calls.create({
+        to: agent.phone,
+        from: config.twilioNumber,
+        url: `${config.appBaseUrl}/twiml/agent-conference?room=${encodeURIComponent(room)}&agentId=${encodeURIComponent(agentId)}&callSid=${encodeURIComponent(callSid)}`,
+        statusCallback: `${config.appBaseUrl}/call-status?parentCallSid=${encodeURIComponent(callSid)}&leg=agent`,
+        statusCallbackEvent: ['completed', 'busy', 'failed', 'no-answer'],
+        statusCallbackMethod: 'POST',
+      }).then(agentLeg => {
+        if (activeCalls[callSid]) activeCalls[callSid].agentLegSid = agentLeg.sid;
+        pushState();
+      }).catch(e => {
+        console.error('[AGENT DIAL]', e.message);
+        cleanupCall(callSid);
+        pushState();
+      });
+    }
   }
+  res.type('text/xml').send(twiml.toString());
+});
+
+app.post('/twiml/agent-conference', (req, res) => {
+  const { room } = req.query;
+  const twiml = new VoiceResponse();
+  twiml.dial().conference(room, {
+    beep: false,
+    startConferenceOnEnter: true,
+    endConferenceOnExit: true,
+    waitUrl: `${config.appBaseUrl}/twiml/hold-loop`,
+  });
   res.type('text/xml').send(twiml.toString());
 });
 
@@ -278,7 +362,7 @@ app.post('/call-status', (req, res) => {
   const { CallSid, CallStatus } = req.body;
   console.log(`[STATUS] ${CallSid} => ${CallStatus}`);
   if (['completed', 'canceled', 'failed', 'busy', 'no-answer'].includes(CallStatus)) {
-    cleanupCall(CallSid);
+    cleanupCall(req.query.parentCallSid || CallSid);
     pushState();
   }
   res.sendStatus(200);
@@ -297,7 +381,9 @@ app.post('/quo-webhook', (req, res) => {
 
   const call = event.data.object;
 
-  // Handle call.ringing — incoming call just started
+  // Quo call IDs start with AC and cannot be controlled through Twilio's Call
+  // API. Keep this webhook for observability/cleanup, but never place a Quo
+  // call in the Twilio answer queue.
   if (eventType === 'call.ringing') {
     const callId = call.id; // AC...
     const direction = call.direction; // 'incoming' or 'outgoing'
@@ -312,21 +398,8 @@ app.post('/quo-webhook', (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Check if already in queue (avoid duplicates)
-    const existing = callQueue.find(c => c.callSid === callId || c.caller === from);
-    if (!existing) {
-      callQueue.push({
-        callSid: callId,
-        caller: from,
-        callerName: 'Unknown', // QUO ringing event doesn't include name, enrichment will fill it
-        enqueuedAt: Date.now(),
-        status: 'waiting',
-        source: 'quo',
-        phoneNumberId: phoneNumberId,
-      });
-      console.log(`[QUO] Added to queue: ${from} (${callId})`);
-      pushState();
-    }
+    console.log(`[QUO] Observed only (not Twilio-answerable): ${from} (${callId}) phoneNumberId=${phoneNumberId}`);
+    broadcast({ type: 'QUO_RINGING', callId, caller: from, phoneNumberId });
   }
 
   // Handle call.completed — call ended
